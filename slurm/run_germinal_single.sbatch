@@ -9,6 +9,8 @@
 #SBATCH --output=jobs/example-%j.out
 #SBATCH --requeue
 
-python -u run_germinal.py
+python -u run_germinal.py \
+run.structure_model=af3 \
+run.af3_repo_path=~/alphafold
 
 echo "finished"

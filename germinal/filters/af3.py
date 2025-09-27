@@ -69,306 +69,10 @@ def create_input_dict(
                 "protein": {
                     "id": [chain_id],
                     "sequence": binder_seq if chain_id == binder_chain else target_seq,
-                    "unpairedMsa": "",
-                    "pairedMsa": "",
                 }
             }
         )
     input_json_data["sequences"] = sequences
-    return input_json_data
-
-
-def remove_a3m_insertions(a3m_path):
-    """
-    Remove insertion characters from A3M MSA file for AF3 compatibility.
-
-    AlphaFold3 requires MSA sequences to have uniform length, so we remove
-    lowercase insertion characters that indicate gaps in the alignment.
-
-    Args:
-        a3m_path (str): Path to the A3M format MSA file to process.
-    """
-    with open(a3m_path, "r") as a3m_file:
-        lines = a3m_file.readlines()
-    new_lines = []
-    for line in lines:
-        line = line.replace("\x00", "")
-        if line.startswith("#") or line.startswith(">"):
-            new_lines.append(line)
-        else:
-            new_lines.append("".join(c for c in line if not c.islower()))
-    with open(a3m_path, "w") as a3m_file:
-        a3m_file.writelines(new_lines)
-
-
-def generate_local_msa(
-    sequence,
-    design_name,
-    output_dir,
-    msa_db_dir,
-    use_gpu=False,
-    use_gpu_server=False,
-    use_metagenomic_db=False,
-):
-    """
-    Generate an unpaired MSA for the given sequence using colabfold_search.
-
-    Args:
-        sequence (str): The sequence to generate an MSA for.
-        design_name (str): The name of the design. Used to name the output file.
-        output_dir (str): The directory to save the output files to.
-        msa_db_dir (str): The directory containing the MSA databases.
-        use_gpu (bool): Whether to use a GPU for the search.
-        use_gpu_server (bool): Whether to use a GPU server for the search.
-        use_metagenomic_db (bool): Whether to use the metagenomic database.
-    """
-    # Start GPU server processes for accelerated MSA search
-    if use_gpu_server:
-        print("Starting GPU server...")
-        gpu_server_dir = os.path.join(msa_db_dir, "colabfold_envdb_202108_db")
-        uniref30_db_dir = os.path.join(msa_db_dir, "uniref30_2302_db")
-        gpu_server_process = subprocess.Popen(
-            [
-                "mmseqs",
-                "gpuserver",
-                gpu_server_dir,
-                "--max-seqs",
-                "10000",
-                "--db-load-mode",
-                "0",
-                "--prefilter-mode",
-                "1",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        print("GPU server started at PID", gpu_server_process.pid)
-        gpu_server_process.wait()
-        uniref30_server_process = subprocess.Popen(
-            [
-                "mmseqs",
-                "gpuserver",
-                uniref30_db_dir,
-                "--max-seqs",
-                "10000",
-                "--db-load-mode",
-                "0",
-                "--prefilter-mode",
-                "1",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        print("Uniref30 server started at PID", uniref30_server_process.pid)
-        uniref30_server_process.wait()
-
-    # Create temporary FASTA file for sequence input
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fasta_path = os.path.join(tmpdir, f"{design_name}.fasta")
-        with open(fasta_path, "w") as fasta_file:
-            fasta_file.write(f">{design_name}\n{sequence}\n")
-        # Create output directory for MSA results
-        msa_out_dir = os.path.join(output_dir, "msas")
-        os.makedirs(msa_out_dir, exist_ok=True)
-        # Build ColabFold search command with appropriate flags
-        cmd = ["colabfold_search"]
-        if use_gpu:
-            cmd += ["--gpu", "1"]
-        if use_gpu_server:
-            cmd += ["--gpu-server", "1"]
-        if not use_metagenomic_db:
-            cmd += ["--use-env", "0"]
-        cmd += [fasta_path, msa_db_dir, msa_out_dir]
-        print(f"Running: {' '.join(cmd)}")
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            print(
-                f"colabfold_search failed for {design_name}: {e}. Falling back to no MSA."
-            )
-            return ""
-        # Locate generated A3M file and rename it appropriately
-        a3m_file = os.path.join(msa_out_dir, f"0.a3m")
-        if os.path.exists(a3m_file):
-            # Rename MSA file to match design name
-            shutil.move(a3m_file, os.path.join(msa_out_dir, f"{design_name}.a3m"))
-            a3m_file = os.path.join(msa_out_dir, f"{design_name}.a3m")
-            # Process MSA to ensure uniform sequence length for AF3
-            remove_a3m_insertions(a3m_file)
-            return os.path.relpath(a3m_file, output_dir)
-        else:
-            print(
-                f"colabfold_search failed for {design_name}: MSA not found at {a3m_file}. Falling back to no MSA."
-            )
-            return ""
-
-
-def call_generate_colabfold_msa_with_timeout(
-    sequence, design_name, output_dir, timeout=120, use_metagenomic_db=False
-):
-    """
-    Generate MSA via ColabFold API with timeout protection.
-
-    Uses ProcessPoolExecutor to enforce a timeout on MSA generation.
-    If timeout is exceeded, the worker process is terminated and an empty
-    MSA path is returned to allow AF3 to continue without MSA.
-
-    Args:
-        sequence (str): Protein sequence for MSA generation.
-        design_name (str): Design identifier for output naming.
-        output_dir (str): Directory to save MSA output.
-        timeout (int): Maximum time in seconds to wait for MSA.
-        use_metagenomic_db (bool): Whether to include metagenomic databases.
-
-    Returns:
-        str: Relative path to generated MSA file, or empty string if failed.
-    """
-
-    with ProcessPoolExecutor(max_workers=1) as exe:
-        fut = exe.submit(
-            generate_colabfold_msa,
-            sequence,
-            design_name,
-            output_dir,
-            use_metagenomic_db,
-        )
-        try:
-            return fut.result(timeout=timeout)
-        except TimeoutError:
-            # Cancel and force-shutdown the pool, killing the worker process.
-            fut.cancel()
-            exe.shutdown(wait=False, cancel_futures=True)
-            print(
-                f"colabfold_search failed for {design_name}: timed out after {timeout}s. Returning empty MSA."
-            )
-            return ""
-
-
-def generate_colabfold_msa(sequence, design_name, output_dir, use_metagenomic_db=False):
-    """
-    Generate unpaired MSA using ColabFold's remote API.
-
-    This function calls the ColabFold web service to generate a multiple
-    sequence alignment for the input protein sequence.
-
-    Args:
-        sequence (str): Protein sequence for MSA generation.
-        design_name (str): Design identifier for output file naming.
-        output_dir (str): Directory to save MSA results.
-        use_metagenomic_db (bool): Whether to search metagenomic databases.
-
-    Returns:
-        str: Relative path to generated MSA file, or empty string if failed.
-    """
-    try:
-        print(
-            f"Running colabfold_search for {design_name} with use_env={use_metagenomic_db}"
-        )
-        run_mmseqs2(
-            sequence,
-            os.path.join(output_dir, f"{design_name}"),
-            use_env=use_metagenomic_db,
-        )
-        print(f"colabfold_search finished for {design_name}")
-    except Exception as e:
-        print(
-            f"colabfold_search failed for {design_name}: {e}. Falling back to no MSA."
-        )
-        return ""
-
-    old_msa_path = os.path.join(output_dir, f"{design_name}_all", "uniref.a3m")
-    # Process MSA to ensure uniform sequence length for AF3 compatibility
-    remove_a3m_insertions(old_msa_path)
-    if os.path.exists(old_msa_path):
-        new_msa_path = os.path.join(output_dir, f"msas/{design_name}.a3m")
-        os.makedirs(os.path.dirname(new_msa_path), exist_ok=True)
-        shutil.copyfile(old_msa_path, new_msa_path)
-        shutil.rmtree(os.path.join(output_dir, f"{design_name}_all"))
-        return os.path.relpath(new_msa_path, output_dir)
-    else:
-        print(
-            f"colabfold_search failed for {design_name}: MSA not found at {old_msa_path}. Falling back to no MSA."
-        )
-        return ""
-
-
-def generate_msas(
-    input_json_data: dict,
-    msa_db_dir: str,
-    output_dir: str,
-    binder_chain: str,
-    msa_mode: str,
-    use_metagenomic_db: bool = False,
-) -> dict:
-    """
-    Generate Multiple Sequence Alignments (MSAs) for protein chains.
-
-    Creates MSAs for each protein chain in the input data using the specified
-    method. MSAs improve structure prediction accuracy by providing evolutionary
-    context. The function supports different MSA generation modes:
-    - "local": Use local ColabFold search with databases
-    - "colabfold": Use ColabFold remote API
-    - "target": Generate MSA only for target protein
-
-    Args:
-        input_json_data (dict): AF3 input JSON containing sequence information.
-        msa_db_dir (str): Path to local MSA databases (for local mode).
-        output_dir (str): Directory to save generated MSA files.
-        binder_chain (str): Chain identifier for the binder protein.
-        msa_mode (str): MSA generation method.
-        use_metagenomic_db (bool): Include metagenomic databases in search.
-
-    Returns:
-        dict: Updated input JSON with MSA paths added to each sequence.
-    """
-    updated_sequences = []
-    for seq_idx, sequence_info in enumerate(input_json_data["sequences"]):
-        chain = sequence_info["protein"]["id"][0]
-        sequence = sequence_info["protein"]["sequence"]
-        if chain != binder_chain:
-            # Check if target MSA already exists to avoid regeneration
-            design_name = "target"
-            relative_msa_path = os.path.join(f"msas/{design_name}.a3m")
-            full_msa_path = os.path.join(output_dir, relative_msa_path)
-
-            if os.path.exists(full_msa_path):
-                sequence_info["protein"]["unpairedMsaPath"] = relative_msa_path
-                updated_sequences.append(sequence_info)
-                continue
-        else:
-            design_name = input_json_data["name"]
-            # Skip binder MSA generation when mode is target-only
-            if msa_mode == "target":
-                updated_sequences.append(sequence_info)
-                # print(f"Skipping MSA generation for {design_name} because msa_mode is target")
-                continue
-
-        # Generate MSA using the specified method
-        if msa_mode == "local":
-            relative_msa_path = generate_local_msa(
-                sequence,
-                design_name,
-                output_dir,
-                msa_db_dir,
-                use_metagenomic_db=use_metagenomic_db,
-            )
-        elif msa_mode == "colabfold" or msa_mode == "target":
-            relative_msa_path = call_generate_colabfold_msa_with_timeout(
-                sequence, design_name, output_dir, use_metagenomic_db=use_metagenomic_db
-            )
-        else:
-            print(f"MSA mode {msa_mode} not recognized. Skipping MSA generation.")
-
-        sequence_info["protein"]["unpairedMsaPath"] = relative_msa_path
-
-        updated_sequences.append(sequence_info)
-        if relative_msa_path != "":
-            print(
-                f"Generated MSA at {relative_msa_path} for {design_name} and sequence {seq_idx}"
-            )
-        else:
-            print(f"No MSA generated for {design_name} and sequence {seq_idx}")
-    input_json_data["sequences"] = updated_sequences
     return input_json_data
 
 
@@ -427,8 +131,6 @@ def extract_structure_and_scores(output_dir, design_name):
 def _run_af3(
     input_json: dict,
     output_dir: str,
-    binder_chain: str,
-    msa_mode: str,
     run_settings: dict,
 ) -> tuple:
     """
@@ -458,49 +160,20 @@ def _run_af3(
     input_dir = os.path.join(output_dir, "af3_inputs")
     os.makedirs(input_dir, exist_ok=True)
     input_path = os.path.join(input_dir, f"{input_json['name']}.json")
-    # Generate MSAs if requested. pass input_dir as the output_dir to save msas there
-    if msa_mode in ["local", "colabfold", "target"]:
-        input_json = generate_msas(
-            input_json,
-            run_settings["msa_db_dir"],
-            input_dir,
-            binder_chain,
-            msa_mode,
-            use_metagenomic_db=run_settings["use_metagenomic_db"],
-        )
 
     # Write updated JSON for AF3
     with open(input_path, "w") as f:
         json.dump(input_json, f)
 
     af3_repo_path = run_settings["af3_repo_path"]
-    weights_path = run_settings["af3_model_dir"]
-    databases_path = run_settings["af3_db_dir"]
-    sif_path = run_settings["af3_sif_path"]
 
     run_cmds = [
-        "singularity",
-        "exec",
-        "--nv",
-        "--env",
-        "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu",
-        "--bind",
-        f"{output_dir}:/root/af_output",
-        "--bind",
-        f"{input_dir}:/root/af_input",
-        "--bind",
-        f"{weights_path}:/root/models",
-        "--bind",
-        f"{databases_path}:/root/public_databases",
-        "--bind",
-        f"{af3_repo_path}:/root/alphafold3",
-        sif_path,
         "python",
-        "/root/alphafold3/run_alphafold.py",
-        "--model_dir=/root/models",
-        "--db_dir=/root/public_databases",
-        f"--output_dir={output_dir}",
-        f"--json_path={input_path}",
+        os.path.join(af3_repo_path, "run_alphafold.py"),
+        "--json_path",
+        input_path,
+        "--output_dir",
+        output_dir,
     ]
 
     popen = subprocess.Popen(
@@ -575,8 +248,6 @@ def run_af3(
     return _run_af3(
         input_json_data,
         output_dir,
-        binder_chain=binder_chain,
-        msa_mode=msa_mode,
         run_settings=run_settings,
     )
 
@@ -584,14 +255,7 @@ def run_af3(
 def main(
     input_json: str,
     output_dir: str,
-    msa_db_dir: str,
-    binder_chain: str,
-    msa_mode: str,
     af3_repo_path: str,
-    af3_sif_path: str,
-    af3_model_dir: str,
-    af3_db_dir: str,
-    use_metagenomic_db: bool,
 ):
     print("Running AF3...")
 
@@ -604,18 +268,11 @@ def main(
             )
             for i, input_json_dict in enumerate(input_json_data):
                 run_settings = {
-                    "msa_db_dir": msa_db_dir,
                     "af3_repo_path": af3_repo_path,
-                    "af3_sif_path": af3_sif_path,
-                    "af3_model_dir": af3_model_dir,
-                    "af3_db_dir": af3_db_dir,
-                    "use_metagenomic_db": use_metagenomic_db,
                 }
                 pdb_path, scores = _run_af3(
                     input_json_dict,
                     output_dir,
-                    binder_chain=binder_chain,
-                    msa_mode=msa_mode,
                     run_settings=run_settings,
                 )
                 results = results.append(
@@ -637,18 +294,11 @@ def main(
                 )
         else:
             run_settings = {
-                "msa_db_dir": msa_db_dir,
                 "af3_repo_path": af3_repo_path,
-                "af3_sif_path": af3_sif_path,
-                "af3_model_dir": af3_model_dir,
-                "af3_db_dir": af3_db_dir,
-                "use_metagenomic_db": use_metagenomic_db,
             }
             pdb_path, scores = _run_af3(
                 input_json_data,
                 output_dir,
-                binder_chain=binder_chain,
-                msa_mode=msa_mode,
                 run_settings=run_settings,
             )
             results = results.append(
@@ -680,55 +330,12 @@ if __name__ == "__main__":
         "--output_dir", "-o", required=True, help="Output directory for AF3 outputs."
     )
     parser.add_argument(
-        "--msa_db_dir",
-        "-d",
-        required=False,
-        help="Path to MSA database directory for ColabFold.",
-    )
-    parser.add_argument(
-        "--binder_chain",
-        "-b",
-        required=False,
-        default="B",
-        help="Chain ID of the binder chain.",
-    )
-    parser.add_argument(
-        "--msa_mode",
-        "-m",
-        required=False,
-        default="colabfold",
-        help="MSA mode. Can be either 'local' or 'colabfold' or 'target' for target only (colabfold default).",
-    )
-    parser.add_argument(
         "--af3_repo_path", required=False, help="Path to local AlphaFold3 repo to bind."
-    )
-    parser.add_argument(
-        "--af3_sif_path",
-        required=False,
-        help="Path to the AlphaFold3 Singularity image (.sif).",
-    )
-    parser.add_argument(
-        "--af3_model_dir", required=False, help="Path to AF3 model weights directory."
-    )
-    parser.add_argument(
-        "--af3_db_dir", required=False, help="Path to AF3 public databases directory."
-    )
-    parser.add_argument(
-        "--use_metagenomic_db",
-        action="store_true",
-        help="Use metagenomic database for MSA generation.",
     )
     args = parser.parse_args()
 
     main(
         input_json=args.input_json,
         output_dir=args.output_dir,
-        msa_db_dir=args.msa_db_dir,
-        binder_chain=args.binder_chain,
-        msa_mode=args.msa_mode,
         af3_repo_path=args.af3_repo_path,
-        af3_sif_path=args.af3_sif_path,
-        af3_model_dir=args.af3_model_dir,
-        af3_db_dir=args.af3_db_dir,
-        use_metagenomic_db=args.use_metagenomic_db,
     )
